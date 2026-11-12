@@ -2058,13 +2058,12 @@ extern "C" void launcher_run(const char *root, int mode) {
                 std::string src_d = trv("The folder with your own extracted game files: exefs (main, main.npdm, sdk...) and "
                                         "romfs, version %s with the update merged in. The game isn't included with Savage Wind.");
                 if (!src.empty()) src_d += std::string("\n\n") + tr("Chosen:") + " " + src;
-                // the step that's running / its result, under the rows and in the Set up row's explanation
+                // the step that's running / its result, under the rows and the Set up button
                 const std::string &job_line = job;
-                std::string ex_d = tr("Copies the game files Savage Wind needs and recompiles the game from them. This only "
+                // what Set up does (under its button)
+                const char *ex_d = tr("Copies the game files Savage Wind needs and recompiles the game from them. This only "
                                       "needs to be done once and may take a while. Your own files aren't changed.");
-                if (!job.empty())
-                    ex_d += std::string("\n\n") + trv(job) + (job_hint.empty() ? "" : std::string(".\n") + trv(job_hint));
-                std::string again_d = tr("Sets the game files up again from the folder chosen above, in place of Savage Wind's "
+                const char *again_d = tr("Sets the game files up again from the folder chosen above, in place of Savage Wind's "
                                          "copy. With no folder chosen, builds the game code again from Savage Wind's copy. "
                                          "Saves and settings are kept.");
 
@@ -2175,24 +2174,40 @@ extern "C" void launcher_run(const char *root, int mode) {
                 }
                 if (!ready || !g_confirm_delete) {  // choose the folder, set up (again: from it, or the game code alone)
                     opt_section(!ready ? "Your copy of the game" : "Set up again");
+                    // what the game comes as: then only what that needs (a choice for the other is dropped)
+                    bool use_pkgs = g_settings.game_packages;
                     if (busy) opt_disable_next();
-                    std::string folder_v = src_pkg ? tr("Choose...") : src_v;
-                    if (opt_action("Game files folder", folder_v.c_str(), src_d.c_str(), true))
-                        SDL_ShowOpenFolderDialog(picked, NULL, win, NULL, false);
-                    if (!src.empty() && !src_pkg) check_left_of_value(folder_v);
+                    if (opt_radio("Extracted game files", !use_pkgs, tr("A folder with the game's extracted exefs and romfs "
+                                  "(and the DLC's RomFS folders, if you have them)."))) use_pkgs = false;
                     if (!ready) first_row();
-                    // or the game packages themselves (runtime/game_import.h), read with the player's own keys
+                    if (busy) opt_disable_next();
+                    if (opt_radio("Game packages (NSP / XCI)", use_pkgs, tr("Your own dump of the game as it comes from the "
+                                  "console: XCI or NSP files, read with your console's keys."))) use_pkgs = true;
+                    if (use_pkgs != g_settings.game_packages) {
+                        g_settings.game_packages = use_pkgs;
+                        settings_save();
+                        pthread_mutex_lock(&g_lock);
+                        if (src_pkg != use_pkgs) g_src.clear(), g_pkgs.clear(), src.clear(), src_pkg = false;
+                        pthread_mutex_unlock(&g_lock);
+                    }
+                    opt_indent(1);
+                    if (!use_pkgs) {
+                    if (busy) opt_disable_next();
+                    if (opt_action("Game files folder", src_v.c_str(), src_d.c_str(), true))
+                        SDL_ShowOpenFolderDialog(picked, NULL, win, NULL, false);
+                    if (!src.empty()) check_left_of_value(src_v);
+                    } else {
+                    // the game packages themselves (runtime/game_import.h), read with the player's own keys
                     std::string pkg_v = tr(src_pkg ? "Selected" : "Choose...");
-                    std::string pkg_d = trv("Or your own dump of the game, chosen together: the base game (XCI or NSP), the "
-                                            "version %s update NSP and, if you have them, the two DLC NSPs. They're "
-                                            "decrypted with your keys and the update is applied over the base game. A "
-                                            "folder holding them can be chosen above too.");
+                    std::string pkg_d = trv("Choose them together: the base game (XCI or NSP), the version %s update NSP "
+                                            "and, if you have them, the two DLC NSPs (or one XCI that holds them all). "
+                                            "They're decrypted with your keys and the update is applied over the base game.");
                     if (src_pkg) {
                         pkg_d += std::string("\n\n") + tr("Chosen:");
                         for (auto &p : pkgs) pkg_d += "\n" + p.substr(p.find_last_of("/\\") + 1);
                     }
                     if (busy) opt_disable_next();
-                    if (opt_action("Game packages (NSP / XCI)", pkg_v.c_str(), pkg_d.c_str(), true))
+                    if (opt_action("Package files", pkg_v.c_str(), pkg_d.c_str(), true))
                         SDL_ShowOpenFileDialog(picked_pkgs, NULL, win, PKG_FILTER, 1, NULL, true);
                     if (src_pkg) check_left_of_value(pkg_v);
                     char keys[1100];
@@ -2206,6 +2221,8 @@ extern "C" void launcher_run(const char *root, int mode) {
                     if (opt_action("Decryption keys", keys_v.c_str(), keys_d.c_str(), true))
                         SDL_ShowOpenFileDialog(picked_keys, NULL, win, KEYS_FILTER, 1, NULL, false);
                     if (have_keys) check_left_of_value(keys_v);
+                    }
+                    opt_indent(-1);
                     if (!ready) opt_section("Set up");
 #ifndef __APPLE__
                     if (shader_precompile_available()) {
@@ -2269,9 +2286,30 @@ extern "C" void launcher_run(const char *root, int mode) {
                             pthread_detach(st);
                         }
                     }
-                    if (busy || (src.empty() && !check_copied_files(g_root).empty())) opt_disable_next();
-                    if (opt_action("Set up game files", busy ? tr("Working...") : "", ready ? again_d.c_str() : ex_d.c_str(),
-                                   true)) {
+                    // SET UP: the page's one big button, under the rows (what it does: the rows' explanation pane)
+                    char keys_found[1100];
+                    gi_find_keys(g_settings.prod_keys, keys_found, sizeof keys_found);
+                    bool keys_missing = src_pkg && !(keys_found[0] && file_exists(keys_found));
+                    bool can_set_up = !busy && !keys_missing && !(src.empty() && !check_copied_files(g_root).empty());
+                    ImGui::Dummy(ImVec2(0, 12 * sc));
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.52f, 0.30f, 1));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.26f, 0.64f, 0.37f, 1));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.17f, 0.44f, 0.26f, 1));
+                    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6 * sc);
+                    ImGui::BeginDisabled(!can_set_up);
+                    std::string set_up = busy ? tr("Working...") : tr(ready ? "Set up again" : "Set up game files");
+                    for (auto &c : set_up) c = (char)toupper((unsigned char)c);
+                    bool set_up_now = ImGui::Button(set_up.c_str(), ImVec2(ImGui::GetContentRegionAvail().x, 58 * sc));
+                    ImGui::EndDisabled();
+                    ImGui::PopStyleVar();
+                    ImGui::PopStyleColor(3);
+                    ImGui::PushTextWrapPos(0);
+                    if (!can_set_up && !busy)
+                        ImGui::TextDisabled("%s", tr(use_pkgs ? "Choose your game packages and keys above first."
+                                                              : "Choose the folder with the game files above first."));
+                    else if (!busy) ImGui::TextDisabled("%s", ready ? again_d : ex_d);
+                    ImGui::PopTextWrapPos();
+                    if (set_up_now) {
                         settings_save();  // (the colour look as chosen above)
                         g_file_size.set_suspended(true);
                         pthread_mutex_lock(&g_lock);
@@ -2354,6 +2392,11 @@ extern "C" void launcher_run(const char *root, int mode) {
                             atomic_store(&g_pc.cancel, true);
                     }
 #endif
+                    if (g_importing && g_build_frac < 0) {  // (unpacking / merging the game packages: hactool is ended)
+                        nnotes = 2;
+                        if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false))
+                            gi_cancel();
+                    }
                     float tfs = g_font_menu->FontSize * 0.75f, sfs = g_font_small->FontSize * 0.85f;
                     ImVec2 ts = g_font_menu->CalcTextSizeA(tfs, FLT_MAX, 0, title);
                     float line_h = g_font_small->CalcTextSizeA(sfs, FLT_MAX, 0, "A").y;

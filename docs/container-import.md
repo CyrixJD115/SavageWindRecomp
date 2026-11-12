@@ -3,13 +3,15 @@
 *Fork-local (branch `feature/container-import`): this decrypts game packages, which upstream's contribution rules
 exclude. Don't open an upstream PR for it.*
 
-The setup page has two ways to bring the game:
+The setup page asks what the game comes as (two radio rows, remembered as `game_source` in `savagewind.ini`) and
+then shows only what that choice needs, above one large **Set up** button:
 
-- **Game files folder**: a folder with the extracted `exefs/` and `romfs/` (the 1.9.0 update merged in) and,
-  optionally, the DLC RomFS folders. This is unchanged.
-- **Game packages (NSP / XCI)**: the player's own dump, picked together: the base game (XCI or NSP), the 1.9.0
-  update NSP and, optionally, the two DLC NSPs, or one XCI that holds all of them. Choosing a folder that holds
-  packages, and no extracted files, does the same.
+- **Extracted game files** shows **Game files folder**: a folder with the extracted `exefs/` and `romfs/` (the
+  1.9.0 update merged in) and, optionally, the DLC RomFS folders. This is unchanged; a folder that holds packages
+  instead of extracted files is read as packages.
+- **Game packages (NSP / XCI)** shows **Package files** and **Decryption keys**. Pick the player's own dump
+  together: the base game (XCI or NSP), the 1.9.0 update NSP and, optionally, the two DLC NSPs, or one XCI that
+  holds all of them. Set up stays disabled until packages are picked and keys are found. Esc / B stops the import.
 
 Packages are read with the player's own `prod.keys`, from the **Decryption keys** row (saved as `prod_keys` in
 `savagewind.ini`). If that row is empty, the setup looks in `~/.switch/prod.keys` and then for a `prod.keys` next to
@@ -41,6 +43,9 @@ Disk: about twice the size of the packages plus 5 GB at the peak. The setup chec
 `tools/hactool/`, the same ones totk-pc-recomp uses. It goes into `build/hactool/`, next to the executable, where
 `rt_resource` finds it. `make NO_HACTOOL=1` skips it. The AppImage (`tools/linux/package.sh`) and the Windows zip
 (`make dist`) ship that folder as `hactool/`, with its LICENSE.
+
+A source build also needs the compiler the setup builds the game code with: `tools/fetch_zig.sh` puts it in
+`build/zig/`. Without it, the setup stops with "A part of Savage Wind is missing".
 
 ## Testing
 

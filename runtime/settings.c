@@ -366,6 +366,7 @@ void settings_load(void) {
         else if (!strcmp(key, "colour_saturation")) g_settings.color_saturation = atoi(val);
         else if (!strcmp(key, "colour_temperature")) g_settings.color_temperature = atoi(val);
         else if (!strcmp(key, "colour_tint")) g_settings.color_tint = atoi(val);
+        else if (!strcmp(key, "game_source")) g_settings.game_packages = !strcmp(val, "packages");
         else if (!strcmp(key, "prod_keys")) snprintf(g_settings.prod_keys, sizeof g_settings.prod_keys, "%s", val);
         else if (!strcmp(key, "colour_lut")) {  // (none: no LUT)
             snprintf(g_settings.color_lut, sizeof g_settings.color_lut, "%s", strcmp(val, "none") ? val : "");
@@ -585,6 +586,7 @@ void settings_save(void) {
     fprintf(f, "colour_tint = %d\n", g_settings.color_tint);
     fprintf(f, "colour_lut = %s\n", g_settings.color_lut[0] ? g_settings.color_lut : "none");
     fprintf(f, "colour_lut_strength = %d\n", g_settings.color_lut_strength);
+    fprintf(f, "game_source = %s\n", g_settings.game_packages ? "packages" : "folder");
     if (g_settings.prod_keys[0]) fprintf(f, "prod_keys = %s\n", g_settings.prod_keys);
     int tl = g_settings.text_language, vl = g_settings.voice_language;
     fprintf(f, "text_language = %s\n", tl > 0 && tl < g_ntext_languages ? g_text_languages[tl].folder : "auto");
