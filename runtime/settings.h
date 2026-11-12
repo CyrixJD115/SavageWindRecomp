@@ -161,6 +161,7 @@ typedef struct {
     int color_tint;          // -100 (green) .. 100 (magenta)
     char color_lut[128];     // color_lut_id(): "" none, "sw:<file>" shipped, "<file>" the player's luts/ folder
     int color_lut_strength;  // percent, 0..100
+    char prod_keys[1024];    // the player's own prod.keys, for game files from NSP / XCI (runtime/game_import.h); "" = ~/.switch
     bool color_lut_set;      // the ini names a LUT (or none): the player chose; the first setup offers COLOR_LUT_RECOMMENDED
     // Options > Accessibility (runtime/assists.c): assists, each off by default
     bool no_weapon_wear;     // weapons, bows and shields lose no durability and never break

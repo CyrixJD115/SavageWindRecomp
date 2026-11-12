@@ -256,7 +256,14 @@ $(B)/ffx/%.o: $(FFX)/sdk/src/%.cpp $(FFX)/ffx_compat.h
 $(B)/rt/nvn/vulkan/framegen.o: CXXFLAGS := -include $(FFX)/ffx_compat.h $(FFX_INC) -I$(FFX)/spirv $(CXXFLAGS)
 $(B)/rt/nvn/vulkan/framegen.o: $(FFX)/spirv/ffx_shaders_vk.h $(FFX)/spirv/ffx_fsr3upscaler_vk.h $(FFX)/ffx_compat.h
 
-all: $(EXE) $(CONFIG_EXE) $(if $(strip $(GEN_SRC)),$(GAMELIB))  # (GEN_SRC is a space when there is no generated/)
+# hactool (SciresM, ISC; pinned and patched by tools/build_hactool.sh): the setup's "Game packages" reads the player's
+# own NSP / XCI with it and their own keys (runtime/game_import.h). Fetched and built once, next to the executable;
+# NO_HACTOOL=1 leaves it out (game files then come from extracted folders only).
+HACTOOL := $(B)/hactool/hactool$(suffix $(EXE))
+all: $(EXE) $(CONFIG_EXE) $(if $(strip $(GEN_SRC)),$(GAMELIB)) $(if $(NO_HACTOOL),,$(HACTOOL))  # (GEN_SRC is a space when there is no generated/)
+$(HACTOOL): tools/build_hactool.sh $(wildcard tools/hactool/*.patch)
+	tools/build_hactool.sh build/hactool-src $(B)/hactool
+hactool: $(HACTOOL)
 
 $(B)/obj/%.o: $(GEN)/%.c runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/simd_softfma.h  # (cpu.h includes them)
 	@mkdir -p $(dir $@)
@@ -415,7 +422,8 @@ dist:
 	@! find tools -maxdepth 1 -name '*.py' -newer build/helper/swgen/swgen.exe | grep -q . || \
 	    { echo "make gen-helper first: tools/*.py changed since build/helper/swgen was frozen"; exit 1; }
 	@[ -x build/zig/zig.exe ] || { echo "tools/fetch_zig.sh first (the compiler)"; exit 1; }
-	$(MAKE) B=$(WIN_B) DEPS=$(CURDIR)/build/deps-win RELEASE=1 $(WIN_B)/savagewind.exe $(WIN_B)/savagewind-config.exe $(WIN_B)/sw-update.exe
+	$(MAKE) B=$(WIN_B) DEPS=$(CURDIR)/build/deps-win RELEASE=1 $(WIN_B)/savagewind.exe $(WIN_B)/savagewind-config.exe $(WIN_B)/sw-update.exe \
+	    $(WIN_B)/hactool/hactool.exe
 	! nm $(WIN_B)/savagewind.exe | grep ' f_70' >/dev/null  # (no game code inside)
 	rm -rf build/dist && mkdir -p "$(DIST)/gamelib-src"
 	cp $(WIN_B)/savagewind.exe $(WIN_B)/savagewind.dll.a "$(DIST)/"
@@ -424,6 +432,7 @@ dist:
 	tools/zig_slim.sh $(strip $(filter-out -Iruntime,$(GENFLAGS))) \
 	    $(if $(GENFLAGS_COMPAT),-- $(strip $(filter-out -Iruntime,$(GENFLAGS_COMPAT))))  # (zig, its runtime built ahead of time)
 	cp -R build/helper/swgen "$(DIST)/"
+	cp -R $(WIN_B)/hactool "$(DIST)/hactool"  # (ISC: reads the player's own game packages, runtime/game_import.h)
 	cp -R build/zig-slim "$(DIST)/zig"
 	cp runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/simd_softfma.h runtime/gamelib.h tools/gamelib_entry.c \
 	    runtime/hle/hle_symbols.txt "$(DIST)/gamelib-src/"
@@ -490,7 +499,7 @@ appimages:
 	tools/linux/appimage.sh x86_64
 	tools/linux/appimage.sh aarch64
 
-.PHONY: dmg all gen gen-helper gen-objs runtime-objs deps deps-windows app dist appimage appimages
+.PHONY: hactool dmg all gen gen-helper gen-objs runtime-objs deps deps-windows app dist appimage appimages
 
 build/test_shaders: tools/test_shaders.m runtime/nvn/maxwell/translate.c runtime/nvn/maxwell/shader.h
 	clang -O1 -fobjc-arc -framework Metal -framework Foundation -o $@ tools/test_shaders.m runtime/nvn/maxwell/translate.c

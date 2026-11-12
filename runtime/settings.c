@@ -193,15 +193,15 @@ void settings_load(void) {
         pc_controls_env();
         return;
     }
-    char line[256];
+    char line[1280];  // (prod_keys: a path)
     bool tip_key = false;
     int version = 1;
     char old_res[16] = "";
     while (fgets(line, sizeof line, f)) {
         char key[64];
-        char val[128];
+        char val[1100];
         val[0] = 0;
-        if (sscanf(line, " %63[^= ] = %127[^\r\n]", key, val) < 1) continue;
+        if (sscanf(line, " %63[^= ] = %1099[^\r\n]", key, val) < 1) continue;
         for (size_t n = strlen(val); n && (val[n - 1] == ' ' || val[n - 1] == '\t'); n--) val[n - 1] = 0;  // (a file
         // edited by hand: Notepad's CRLF line ends and stray spaces would make the names below not match)
         if (!strcmp(key, "fullscreen")) g_settings.fullscreen = atoi(val) != 0;
@@ -366,6 +366,7 @@ void settings_load(void) {
         else if (!strcmp(key, "colour_saturation")) g_settings.color_saturation = atoi(val);
         else if (!strcmp(key, "colour_temperature")) g_settings.color_temperature = atoi(val);
         else if (!strcmp(key, "colour_tint")) g_settings.color_tint = atoi(val);
+        else if (!strcmp(key, "prod_keys")) snprintf(g_settings.prod_keys, sizeof g_settings.prod_keys, "%s", val);
         else if (!strcmp(key, "colour_lut")) {  // (none: no LUT)
             snprintf(g_settings.color_lut, sizeof g_settings.color_lut, "%s", strcmp(val, "none") ? val : "");
             g_settings.color_lut_set = true;
@@ -584,6 +585,7 @@ void settings_save(void) {
     fprintf(f, "colour_tint = %d\n", g_settings.color_tint);
     fprintf(f, "colour_lut = %s\n", g_settings.color_lut[0] ? g_settings.color_lut : "none");
     fprintf(f, "colour_lut_strength = %d\n", g_settings.color_lut_strength);
+    if (g_settings.prod_keys[0]) fprintf(f, "prod_keys = %s\n", g_settings.prod_keys);
     int tl = g_settings.text_language, vl = g_settings.voice_language;
     fprintf(f, "text_language = %s\n", tl > 0 && tl < g_ntext_languages ? g_text_languages[tl].folder : "auto");
     fprintf(f, "voice_language = %s\n", vl > 0 && vl < g_nvoice_languages ? g_voice_languages[vl].folder : "text");
