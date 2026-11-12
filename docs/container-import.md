@@ -22,118 +22,136 @@ extract_thread
   ├─ picked a folder with exefs/romfs   → find_game() (existing path, untouched)
   ├─ picked .nsp / .xci file(s), or a folder whose search found containers and no exefs/romfs
   │      └─ container_extract(sources, keys, out=extracted/)      ← new stage (runtime/containers/)
-  │            1. parse containers (PFS0 for NSP, HFS0 for XCI), collect NCAs + CNMTs + tickets
-  │            2. classify by CNMT: base 01007ef00011e000, update ...e800, DLC ...f001/f002
-  │            3. verify the update's ExeFS main build id == the supported version's
-  │            4. extract merged tree: exefs/ (from the update), romfs/ (BKTR base+update), aoc1/ aoc2/
+  │            1. parse containers in place (PFS0 for NSP, HFS0 for XCI — no decryption needed)
+  │            2. decrypt each NCA's header (XTS) and classify: base ...e000, update ...e800 (the program
+  │               NCA with a BKTR section), DLC ...f001/f002; keygen per NCA (max(crypto, crypto2), -1);
+  │               collect common tickets when present
+  │            3. verify against the supported version, then extract:
+  │                 hactool --exefsdir=extracted/exefs <update program NCA>
+  │                 hactool --basenca=<base program NCA> --romfsdir=extracted/romfs <update program NCA>
+  │                 hactool --romfsdir=extracted/aoc<n> <DLC NCA>            (aoc1 = ...f001, aoc2 = ...f002)
+  │            4. verify results (ExeFS main build id, romfs System/Version.txt, aoc AocVersion.txt)
   │            5. write container manifest (sources + digests → cache check)
   └─ build_game_code() / check_game_files() / precompile      (existing code, unchanged)
 ```
 
+The heavy decryption and the BKTR merge are done by a **vendored hactool binary** run as a child process —
+the same tool the generator and the compiler already are here (`gamebuild.c` spawns `swgen` and `zig`), and the
+approach totk-pc-recomp uses in practice (its `tools/extract.py` drives a vendored hactool with
+`--basenca` for exactly this merge). hactool verifies every IVFC level of the merged RomFS itself; our stage
+checks its log for `Level n (GOOD)` and treats its two always-failing Nintendo signature lines as noise.
 Nothing downstream changes: the game still consumes a plain `extracted/` folder, and the folder path stays the
 default and always available.
+
+Validated end to end against real files (2026-11-12): base XCI + update NSP + DLC NSPs of a personal dump →
+`exefs/` (main build id `cd57b23fa4bbad65`), merged `romfs/` (System/Version.txt "1.9.0", ~41k files, five
+IVFC levels GOOD), `aoc1/` (AocVersion 3.0).
 
 ## 2. New files and modules
 
 All new logic in one self-contained C module (the runtime is C; `launcher.mm` is C++ and calls it through the
-`extern "C"` header). One Makefile line adds the sources to `RT_SRC`.
+`extern "C"` header). One Makefile line adds the sources to `RT_SRC`. The module does the light work natively
+(container tables, NCA headers, classification, keys sanitizing, orchestration) and runs the vendored hactool
+for everything crypto-heavy:
 
 ```
 runtime/containers/
   containers.h        public API: classification result, extract entry point, progress/cancel, error strings
-  containers.c        orchestrator: sources → titles → merged tree + manifest
-  keys.c keys.h       prod.keys / title.keys parsing (hactool INI format), key lookup, titlekey unwrap,
-                      missing-key reporting per title
+  containers.c        orchestrator: sources → titles → hactool invocations → merged tree + manifest
+  keys.c keys.h       prod.keys parsing, sanitized copy for hactool (drop comments and malformed lines: the
+                      user's dump has 30-hex-digit mariko kek sources hactool would exit on), ticket collection
+                      (title.keys lines for rights-managed NCAs), missing-key reporting per title
   pfs0.c              NSP PFS0 (entry strides 0x20 and 0x18 — NSCB split output uses 0x18; detect by tiling)
-  hfs0.c              XCI: gamecard header, root/partition HFS0, secure partition contents
-  cnmt.c              CNMT + NACP parsing, title classification, content lists
-  nca.c               NCA3 header (XTS, 0xC00 = 6 sectors, BE sector tweaks), sections, ExeFS extract,
-                      NPDM extract
-  bktr.c              patch RomFS: relocation + subsection tables, indirect addressing over the base NCA
-  romfs.c             RomFS (virtual, base+patch) directory walk → folder extraction; DLC RomFS extraction
-  crypto/aes.c        AES-128 ECB/CTR/XTS (XTS over 0x200 sectors)
-  crypto/sha256.c     SHA-256 (manifest, section hashes, ExeFS header hashes)
-  crypto/rsa.c        RSA-2048 bignum + OAEP unwrap (ticket titlekeys) + PKCS1 v1.5 signature check
-  crypto/bignum.c     small fixed-size bignum (limbs of uint32/uint64) for RSA
+  hfs0.c              XCI: "HEAD" at 0x100, root HFS0 offset (u64) at 0x130, secure partition contents
+  nca.c               NCA3 header decrypt (XTS, 0xC00 = 6 sectors of 0x200, sector number big-endian),
+                      section table (0x240: u32 media start/end pairs), FS headers (0x400 + i*0x200:
+                      partition/fs/crypt types at +2/+3/+4), keygen and key-area checks, classification
+  plat_process.h      child process plumbing (reuse the platform spawn/wait already in the runtime)
+toolchain/
+  hactool/            vendored binary per platform + its ISC license file (built from SciresM/hactool at a
+                      pinned commit; totk-pc-recomp's tools/build_hactool.py is the recipe)
 tools/
   make_container_fixtures.py   builds synthetic NSP/XCI fixtures with test keys (no Nintendo data)
-  test_containers.c            unit tests: fixtures → classification → extraction → BKTR merge results
+  test_containers.c            unit tests: fixtures → classification → extraction → merge results
+  build_hactool.sh             the vendored build (clone at pin, build, copy binary + license)
 ```
+
+Crypto needed natively is only AES-128-XTS for NCA headers (one key, six sectors) — a few hundred lines —
+since hactool does the rest. No RSA, no CTR/XTS storage paths, no RomFS walker of our own.
 
 Settings (`runtime/settings.h`, savagewind.ini): `keys_prod[1024]`, `keys_title[1024]` (paths only).
 
 ## 3. What to reference (not vendor wholesale)
 
-The byte-level details below were validated against real containers with a prototype; keep them as the spec:
+The byte-level details below were validated against real containers (the player's own dump) with a working
+prototype; keep them as the spec:
 
 - **PFS0 (NSP)**: 0x10 header (magic, count, string size, pad), entries `u64 off, u64 size, u32 name_off`
   padded to **0x20**; NSCB-split output pads to **0x18** instead — detect by which stride tiles the container
-  (`data_start + Σsizes ≤ filesize` and monotonic offsets).
+  (`data_start + Σsizes ≤ filesize` and monotonic offsets). Names are NUL-terminated in the string table.
+- **XCI**: "HEAD" magic at 0x100, **root HFS0 offset (u64) at 0x130**; partitions update/normal/secure, game
+  content in `secure` (HFS0 entries are 0x40 bytes: off u64, size u64, name u32, hashed flag, hashes).
 - **NCA3 header**: XTS-encrypted region is **0xC00 = 6 × 0x200 sectors, sector number big-endian** in the
-  tweak. Fields: magic 0x200, crypto_type 0x206, kaek_ind 0x207, size u64 0x208, title id 0x210,
-  crypto_type2 0x220, rights id 0x230, section table (4 × u32 media_start + media_end) 0x240, section
-  SHA-256s 0x280, key area 4×16 0x300, FS headers 0x200 each at 0x400 (part type +2, fs type +3
-  (2=PFS0, 3=IVFC), crypt type +4 (1=none, 3=CTR, 4=BKTR), superblock +8, CTR nonce +0x140, and for BKTR
-  sections the relocation/subsection headers at +0x100/+0x120, each pointing at a "BKTR"-magic table inside
-  the section's media range).
-- **CTR**: counter = nonce (8 bytes as stored) ‖ BE64(absolute byte offset in the NCA >> 4). This is hactool's
-  construction and NSCB's (squirrel `Counter.new(64, prefix=nonce, initial_value=(sec_off+off)>>4)`).
-- **Keys**: keygen = `max(crypto_type, crypto_type2)`, then **-1** (0 stays 0: revisions 0 and 1 are master key
-  0). Body key = key-area slot 2 (card/XCI content, `rights_id` zero) decrypted ECB with
-  `key_area_key_{application|ocean|system}_{keygen}` per `kaek_ind`; ticket content (`rights_id` set) unwraps
-  the ticket's RSA-OAEP blob with the eticket RSA key decrypted from `eticket_rsa_kek`, falling back to
-  `title.keys` entries (`<rights id 32 hex> = <encrypted titlekey>`).
-- **BOTW update NCAs** (verified): the update's program NCA carries the **full 1.9.0 ExeFS** as a plain CTR
-  PFS0 — no ExeFS patching needed; its RomFS is a **BKTR** section applied over the base's RomFS. BKTR data:
-  bucket headers ("BKTR", version, entry count) at the offsets in the FS header; relocation entries
-  (virtual offset, physical offset, type: 0 = from patch, 1 = from base), subsection entries carry their own
-  CTR restart offsets (counter uses the subsection's physical offset).
+  tweak. Fields: magic 0x200, crypto_type 0x206, kaek_ind 0x207, size u64 0x208 (must equal the container
+  entry's size), title id 0x210, crypto_type2 0x220, rights id 0x230, section table (4 × u32 media start +
+  media end) 0x240, section SHA-256s 0x280 (each is the hash of that section's 0x200-byte FS header — a free
+  header-decryption check), key area 4×16 0x300.
+- **FS headers** at 0x400 + i*0x200: partition type +2, fs type +3 (2=PFS0, 3=IVFC), crypt type +4
+  (1=none, 2=XTS, 3=CTR, 4=BKTR); **PFS0 sections keep a SHA-256 hash table before the PFS0 header** (the
+  superblock at +0x28/+0x30 gives blocksize, levels, hashoff/hashsize, pfsoff/pfssize — the update ExeFS's
+  PFS0 sits at +0x8000). Validate decryption at `pfsoff`, never at 0. BKTR sections carry their
+  relocation/subsection table offsets in the superblock at +0x100/+0x120 ("BKTR"-magic headers inside the
+  section's media range).
+- **Keys**: keygen = `max(crypto_type, crypto_type2)`, then **-1** (0 stays 0). Body key = key-area slot 2
+  decrypted ECB with `key_area_key_{application|ocean|system}_{keygen}` per `kaek_ind` when `rights_id` is
+  zero (card/XCI-style content — the common case, no ticket involved); rights-managed NCAs use
+  `titlekek_{keygen}` on the ticket's key block. **Expect mixed keygens within one dump**: NSCB-style
+  conversions rewrite base/DLC NCAs to keygen 0 while the update stays at its real generation (BOTW 1.9.0
+  dumps show base at 0/0 and update at 2/3) — derive it per NCA.
+- **hactool and keys files**: hactool exits on lines it can't parse (comments, trailing notes, a trailing NUL
+  Lockpick puts on `*_kek_source`, any key with the wrong hex length) — always hand it a sanitized copy, never
+  the player's file. Its two Nintendo signature checks always print (FAIL) — that is noise, not an error;
+  trust the IVFC `Level n (GOOD)` lines and the extracted results.
 
-Reference implementations, in order of usefulness (read for semantics; reimplement in project style):
+Reference implementations, in order of usefulness:
 
-1. **hactool** (ISC, SciresM) — `nca.h`/`nca.c` are the definitive byte layout; `crypto/` (aes, xts, sha,
-   rsa with BigInt) is small, proven, and license-compatible to adapt nearly verbatim with attribution.
-2. **nstool** (MIT, jakcron) + **libtoolchain** — NCA/NSP/XCI/HFS0 object model, `--basenca` BKTR handling,
-   clean C++ structure worth mirroring for the module layout.
-3. **NSC_BUILDER squirrel.py** (MIT) — bulk NSP/XCI handling, title classification by CNMT, key-management
-   patterns; its `Fs/pyNCA3.py` documents the 0x18-stride PFS0 quirk and the CTR counter in Python.
-4. **LibHac / hactoolnet** (MIT, Thealexbarney) — the cleanest BKTR model (`IndirectStorage`,
-   `AesCtrSubsectionStorage`) for the merge semantics.
+1. **totk-pc-recomp** (valentderah) — `tools/vendor/macnativegames/extract_exefs.py` is a compact, proven,
+   game-agnostic reader of exactly these containers (PFS0/HFS0 with the 0x18-stride quirk, XCI root at 0x130,
+   common-ticket parsing, key-area/titlekey selection, ExeFS extraction with full hash verification), and its
+   `tools/extract.py` + `build_hactool.py` show the vendored-hactool BKTR merge end to end. Read it first.
+2. **hactool** (ISC, SciresM) — the binary we vendor; `nca.h` is the definitive byte layout.
+3. **NSC_BUILDER squirrel.py** (MIT) — NSCB's Python; documents the split-NSP conventions the dumps use.
+4. **nstool** (MIT) / **LibHac** (MIT) — deeper format semantics if the native scope ever grows.
    (Avoid hac2l: GPLv2.)
-
-Crypto beyond AES/SHA (RSA-2048 CRT + OAEP for ticket titlekeys) is the only heavy piece; adapting hactool's
-`rsa.c`/`BigInt` (ISC) keeps it contained. XCI gamecard-header key areas use `xci_header_key` from prod.keys
-when encrypted (rare); refuse with a clear message if it's missing.
 
 ## 4. Implementation plan
 
 **Phase 1 — MVP (NSP base + update → merged exefs/romfs):**
-1. `keys.c` (parse prod.keys; report missing keys by name), `crypto/` (AES-XTS/CTR, SHA-256).
-2. `pfs0.c` (both strides) + `nca.c` header/sections + CTR decrypt; unit-test against self-built fixtures.
-3. ExeFS extraction from the update's program NCA (PFS0 → `exefs/`: main, main.npdm, rtld, sdk, subsdk0…),
-   build-id check against `GAME_VERSIONS` — fail before writing anything if it isn't 1.9.0.
-4. `cnmt.c` classification (base/update/DLC by title id and CNMT type) and NCA-id matching across base and
-   update content.
-5. `bktr.c` + `romfs.c`: merged virtual RomFS → `romfs/` folder extraction (patch tables from the update's
-   FS header, indirect extents served from base or patch NCA).
-6. `containers.c` orchestrator + manifest; CLI `--extract-container` for headless testing; Makefile + test
-   target `test-containers`.
+1. Vendored hactool build (`tools/build_hactool.sh`: clone SciresM/hactool at the pin totk-pc-recomp uses,
+   build, copy binary + ISC license into `toolchain/hactool/` per platform).
+2. `keys.c`: parse prod.keys, write the sanitized copy hactool reads, collect common tickets into a
+   `title.keys`-format file (hactool's patched builds read them; rights-managed NSPs need it), report missing
+   keys by name.
+3. `pfs0.c` + `hfs0.c` + `nca.c`: in-place container walk, NCA header decrypt and classification (base =
+   program NCA of ...e000; update = program NCA whose FS header crypt type is 4/BKTR; DLC = content type 5,
+   aoc1 = ...f001, aoc2 = ...f002), ExeFS build-id check against `GAME_VERSIONS` before extracting anything.
+4. `containers.c` orchestrator: extract each Program NCA to a scratch file (both are needed on disk for
+   `--basenca`; ~15 GB scratch, check free space like `room_for_build`), run hactool for
+   exefs/romfs/aoc folders, verify its IVFC `Level n (GOOD)` lines and the extracted markers
+   (`exefs/main` build id, `romfs/System/Version.txt`, `aoc1/System/AocVersion.txt`), write the manifest.
+5. `--extract-container` CLI for headless testing; Makefile + `test-containers` target.
 
-**Phase 2 — XCI + DLC:** `hfs0.c` (root/partition HFS0, secure partition as a PFS0-equivalent source,
-gamecard key areas), DLC extraction to `aoc1`/`aoc2` **by title id** (F001 → aoc1, F002 → aoc2 — the folder
-path sorts by file count; containers can do better), `title.keys` fallback path, ticket handling.
-
-**Phase 3 — launcher + UI integration:** picker changes, keys rows, status/failure texts, manifest caching
+**Phase 2 — launcher + UI integration:** picker changes, keys rows, status/failure texts, manifest caching
 (§5), i18n tables, `docs/game-files.md` update.
 
-**Phase 4 — hardening:** every §6 edge case gets its own clear message and a fixture test.
+**Phase 3 — hardening:** every §6 edge case gets its own clear message and a fixture test. A native
+(BKTR-in-C) extractor remains optional future work; the vendored hactool path is the shipped one.
 
 Testing: `tools/make_container_fixtures.py` writes tiny NSP/XCI fixtures encrypted with keys generated in the
 script (synthetic content, no Nintendo data — base/update/DLC "NCAs" with fake RomFS trees and an NSO whose
-build id equals a constant the test defines); `tools/test_containers.c` round-trips them (classify → decrypt →
-merge → extract → compare trees, including BKTR indirect extents in both directions). Gameplay validation
-needs the player's own dump (see docs/FAQ.md: files must be their own 1.9.0 copy) via
-`SAVAGEWIND_SETUP_CONTAINERS` → `tools/linux/test_run.sh`.
+build id equals a constant the test defines); `tools/test_containers.c` round-trips them (classify → extract →
+compare trees). The real-file pipeline was already validated with a prototype (see §1); gameplay validation
+runs the player's own dump via `SAVAGEWIND_SETUP_CONTAINERS` → `tools/linux/test_run.sh`.
 
 ## 5. CLI flags, UI, caching
 
@@ -160,9 +178,12 @@ needs the player's own dump (see docs/FAQ.md: files must be their own 1.9.0 copy
 - **No update picked**: base alone can't produce 1.9.0 — refuse with "the update is required", listing the
   titles found. **Update is the wrong version**: the ExeFS build-id check names the found version.
 - **Wrong/missing keys**: distinguish (a) no keys file, (b) missing `header_key` / `master_key_xx` /
-  `key_area_key_*_xx` / `eticket_rsa_kek` for the titles present (name the key), (c) wrong keys — NCA magic
-  doesn't decrypt → "these keys don't decrypt this content" (this also catches re-encrypted repacks, which
-  no keys can open), (d) `title.keys` needed for ticket NSPs and absent.
+  `key_area_key_*_xx` / `titlekek_xx` for the keygen generations present (name the key — a dump can mix
+  generations across base/update/DLC), (c) wrong keys — NCA magic doesn't decrypt → "these keys don't decrypt
+  this content", (d) a rights-managed NCA whose common ticket is missing from the NSP.
+- **Keys file quirks** (seen in real dumps): comment lines, trailing notes after the value, a trailing NUL on
+  `*_kek_source`, wrong-length values — the sanitized copy for hactool drops or fixes these; never modify the
+  player's file.
 - **Multi-program / multi-NCA titles**: merge per content NCA id across base+update (program, data, control,
   html, legal); ExeFS from the program NCA only; union of the merged RomFS trees into `romfs/` (patch wins).
 - **DLC-only pick**: allowed when `extracted/` is already set up (mirrors today's DLC-only folder path);
@@ -182,7 +203,7 @@ needs the player's own dump (see docs/FAQ.md: files must be their own 1.9.0 copy
 
 ## Status
 
-- Design: this document.
+- Design: this document (revised after validating the whole pipeline against a real dump).
+- Validated end to end on real files (prototype): containers → classification → hactool BKTR merge →
+  `exefs/` (build id `cd57b23fa4bbad65`), `romfs/` (Version.txt "1.9.0"), `aoc1/` (AocVersion 3.0).
 - Implementation: not started (branch `feature/container-import`).
-- Real-file validation: prototype confirmed the format facts above; end-to-end gameplay validation needs the
-  player's own 1.9.0 dump (repacked/scene NSP-XCI sets cannot be decrypted by design and are refused).
