@@ -2228,10 +2228,11 @@ extern "C" void launcher_run(const char *root, int mode) {
                     if (shader_precompile_available()) {
                         if (busy) opt_disable_next();
                         {   // the background (ui/splash.mm), from the next start
-                            static const char *const pics[START_PICTURE_COUNT] = {"Savage Wind", "A screenshot", "Latest save"};
+                            static const char *const pics[START_PICTURE_COUNT] = {"Savage Wind", "A screenshot", "Latest save", "None"};
                             if (opt_choice("Background", &g_settings.start_picture, pics, START_PICTURE_COUNT,
                                            START_PICTURE_SCREENSHOT, "The picture behind this screen and while the game loads. A splash.jpg or splash.png of yours in the data folder always comes first."))
                                 settings_save();
+                            if (g_settings.start_picture == START_PICTURE_NONE) opt_disable_next();  // (no picture to show)
                             if (opt_toggle("Loading picture", &g_settings.boot_picture, true, "Shows that picture while the game loads. Turned off, the window stays black until the game's title screen: loading takes just as long."))
                                 settings_save();
                         }

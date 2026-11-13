@@ -74,7 +74,8 @@ enum { TEX_LOD_DEFAULT = 0, TEX_LOD_SHARP = 1, TEX_LOD_SHARPER = 2, TEX_LOD_COUN
 // binaural head-shadow and ear-delay cues for headphones.
 enum { AUDIO_OUT_STEREO = 0, AUDIO_OUT_SURROUND_51 = 1, AUDIO_OUT_HEADPHONES_3D = 2, AUDIO_OUT_COUNT };
 // The start screen's background, when there is no splash.jpg / .png of the player's in the data folder
-enum { START_PICTURE_ART, START_PICTURE_SCREENSHOT, START_PICTURE_SAVE, START_PICTURE_COUNT };
+enum { START_PICTURE_ART, START_PICTURE_SCREENSHOT, START_PICTURE_SAVE,
+       START_PICTURE_NONE /* a plain dark start screen, and no picture while the game loads */, START_PICTURE_COUNT };
 
 typedef struct {
     bool fullscreen;
