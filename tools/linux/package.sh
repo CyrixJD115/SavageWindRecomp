@@ -32,6 +32,7 @@ fi
 make -j"$JOBS" B="$B" DEPS="$P" "${MAKEARGS[@]}" "$B/savagewind"  # (the DEPS link line asks for libshaderc_shared itself)
 if nm "$B/savagewind" | grep ' f_70' >/dev/null; then echo "$B/savagewind has game code linked in"; exit 1; fi
 ZIG_TARGET=$ARCH-linux tools/fetch_zig.sh
+CC="$CROSSCC" tools/build_hactool.sh "$L/hactool-src" "$L/hactool"  # (the setup's game packages: runtime/game_import.h)
 
 # ---- AppDir
 rm -rf "$APPDIR" && mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/lib"
@@ -50,6 +51,7 @@ mkdir "$APPDIR/usr/bin/colour-luts" && cp third_party/luts/*.cube third_party/lu
 cp README.md LICENSE "$APPDIR/usr/bin/"  # (licenses and source links of the bundled components: README "License")
 [ -d "$L/helper/swgen" ] || { echo "no game code generator helper: tools/linux/gen_helper.sh $ARCH first"; exit 1; }
 cp -R "$L/helper/swgen" build/zig "$APPDIR/usr/bin/"
+cp -R "$L/hactool" "$APPDIR/usr/bin/hactool"  # (ISC, its LICENSE inside)
 mkdir "$APPDIR/usr/bin/gamelib-src"
 cp runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/simd_softfma.h runtime/gamelib.h tools/gamelib_entry.c \
    runtime/hle/hle_symbols.txt "$APPDIR/usr/bin/gamelib-src/"

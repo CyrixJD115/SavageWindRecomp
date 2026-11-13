@@ -53,6 +53,7 @@ extern "C" {
 #include "game_versions.h"
 #include "dlc_check.h"
 #include "romfs_build.h"
+#include "game_import.h"
 #include "problem_report.h"
 #include "post_update.h"
 #include "steam_shortcuts.h"
@@ -302,7 +303,9 @@ extern "C" bool launcher_config_key_held(void) { return (NSEvent.modifierFlags &
 // The player brings their own game files: a folder holding exefs/ and romfs/. They're copied into the data root (APFS
 // clones / hard links where the file system allows); the game reads romfs/ in place (runtime/romfs_image.h).
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
-static std::string g_src;           // the picked folder
+static std::string g_src;           // the picked folder, or the first of the picked game packages
+static std::vector<std::string> g_pkgs;  // the picked game packages (NSP / XCI: runtime/game_import.h), or none
+static std::string g_keys_pick;     // a prod.keys just chosen (the dialog's thread: saved by the window's)
 static std::string g_job;           // current setup step / result for the status line
 static std::string g_job_hint;      // a failure: what to do about it (shown under it)
 static bool g_busy, g_job_failed;
@@ -420,6 +423,7 @@ static std::atomic<unsigned long long> g_done, g_total;
 // The bar: copying is the first tenth, building the game code (runtime/gamebuild.c) the rest
 static std::atomic<float> g_build_frac{-1};  // -1: not building
 static bool g_copy_skipped;                  // (only the game code to build: the bar is all of that)
+static bool g_importing;                     // (from game packages: unpacking and merging is the first half)
 static void setup_progress(uint64_t done, uint64_t) { g_done = done; }
 static void build_progress(double f, const char *step) {
     g_build_frac = (float)f;
@@ -428,7 +432,8 @@ static void build_progress(double f, const char *step) {
 }
 static float extract_progress(void) {
     unsigned long long t = g_total, d = g_done;
-    float b = g_build_frac, f = b >= 0 ? (g_copy_skipped ? b : 0.1f + 0.9f * b) : t ? 0.1f * (float)((double)d / (double)t) : 0;
+    float share = g_importing ? 0.5f : 0.1f;
+    float b = g_build_frac, f = b >= 0 ? (g_copy_skipped ? b : share + (1 - share) * b) : t ? share * (float)((double)d / (double)t) : 0;
     return f < 0 ? 0 : f > 0.99f ? 0.99f : f;
 }
 
@@ -761,14 +766,182 @@ static bool path_inside(const std::string &path, const std::string &folder) {
     return !strncmp(a, b, n) && (a[n] == '/' || a[n] == '\\' || !a[n]);
 }
 
+// ---- game files from game packages (runtime/game_import.h): the player's own NSP / XCI dump, decrypted with their own
+// prod.keys by the bundled hactool, the update applied over the base game's RomFS. Written straight into the data
+// root's exefs/ romfs/ aoc1/ aoc2/, as a folder of extracted files is copied there.
+static std::atomic<unsigned long long> g_import_base;
+static void import_progress(uint64_t done, uint64_t) { g_done = g_import_base + done; }
+
+// The packages in a folder (and a level below it: dumps keep base, update and DLC side by side)
+static void find_packages(const std::string &dir, int depth, std::vector<std::string> &out) {
+    DIR *d = opendir(dir.c_str());
+    if (!d) return;
+    std::vector<std::string> sub;
+    while (struct dirent *e = readdir(d)) {
+        std::string n = e->d_name, p = dir + "/" + n;
+        if (n[0] == '.') continue;
+        if (gi_is_package(n.c_str()) && !is_dir(p)) out.push_back(p);
+        else if (depth < 1 && is_dir(p)) sub.push_back(p);
+    }
+    closedir(d);
+    for (auto &s : sub) find_packages(s, depth + 1, out);
+    std::sort(out.begin(), out.end());
+}
+
+static void set_import_failure(GiResult r, const char *why) {
+    std::string detail = why;
+    for (auto &c : detail) if (c == '%' || ((unsigned char)c < 0x20 && c != '\n')) c = ' ';
+    const char *head, *hint;
+    switch (r) {
+    case GI_E_NO_TOOL:
+        head = "A part of Savage Wind is missing", hint = "The hactool folder that reads game packages is missing. Get the "
+               "release again, or choose a folder with the game's extracted files instead.";
+        break;
+    case GI_E_NO_KEYS:
+        head = "Your keys can't be read", hint = "Choose your prod.keys again under Decryption keys.";
+        break;
+    case GI_E_KEYS_INCOMPLETE:
+        head = "Your keys are incomplete", hint = "The keys file has no header_key. Dump the keys from your console again "
+               "and choose that prod.keys.";
+        break;
+    case GI_E_KEYS_WRONG:
+        head = "These keys don't open the game packages", hint = "Choose the prod.keys dumped from your own console, "
+               "updated to a firmware at least as new as the game's update.";
+        break;
+    case GI_E_COMPRESSED:
+        head = "Compressed game packages can't be used", hint = "Decompress the NSZ / XCZ files to NSP / XCI first.";
+        break;
+    case GI_E_TITLEKEY:
+        head = "A title key is missing", hint = "This package needs its ticket. Put your title.keys next to your prod.keys, "
+               "or use a package that includes its ticket.";
+        break;
+    case GI_E_CANCELLED:
+        set_job("Setup stopped.");
+        return;
+    default:
+        head = "The game packages can't be read", hint = "Make sure there's enough free space and the files are complete, "
+               "then try again. The log has the details.";
+    }
+    set_job(head, true, trv(hint) + (detail.empty() ? "" : "\n\n" + std::string(tr("Details:")) + " " + detail));
+}
+
+// 0: failed (the job line says why), 1: the game's files set up (the game code is next), 2: DLC alone added
+static int import_packages(const std::vector<std::string> &pkgs) {
+    char keys[1100];
+    gi_find_keys(g_settings.prod_keys, keys, sizeof keys);
+    for (size_t i = 0; !keys[0] && i < pkgs.size(); i++) {  // (prod.keys kept next to the dump)
+        std::string k = pkgs[i].substr(0, pkgs[i].find_last_of("/\\") + 1) + "prod.keys";
+        if (file_exists(k)) snprintf(keys, sizeof keys, "%s", k.c_str());
+    }
+    if (!keys[0]) {
+        set_job("Decryption keys needed", true, "Game packages are read with the keys of your own console. Choose your "
+                "prod.keys under Decryption keys, then set up again.");
+        return 0;
+    }
+    unsigned long long in = 0;
+    for (auto &p : pkgs) {
+        struct stat st;
+        if (stat(p.c_str(), &st) == 0) in += (unsigned long long)st.st_size;
+    }
+    {   // the unpacked packages and the files made from them, then the game code's build
+        unsigned long long need = 2 * in + (5ull << 30);
+        std::error_code ec;
+        std::filesystem::space_info si = std::filesystem::space(rt_data_root(), ec);
+        if (const char *t = getenv("SAVAGEWIND_TEST_FREE_GB")) si.available = strtoull(t, NULL, 10) << 30;
+        if (!ec && si.available < need) {
+            char hint[400];
+            snprintf(hint, sizeof hint, tr("Setting up from game packages needs about %.0f GB free on this disk and there are "
+                                           "%.1f GB. Free some space and choose Set up game files."),
+                     need / 1073741824.0, si.available / 1073741824.0);
+            set_job("Not enough free disk space", true, hint);
+            return 0;
+        }
+    }
+    struct Done {  // (the scratch folder goes, whatever happens)
+        GiSet s;
+        ~Done() { gi_close(&s); }
+    } w;
+    GiSet &s = w.s;
+    std::vector<const char *> argv;
+    for (auto &p : pkgs) argv.push_back(p.c_str());
+    std::string work = std::string(rt_data_root()) + "/import";
+    char why[1500] = "";
+    g_importing = true, g_done = 0, g_total = 2 * in, g_import_base = 0;
+    set_job("Unpacking the game packages...");
+    GiResult r = gi_open(&s, argv.data(), (int)argv.size(), keys, work.c_str(), import_progress, why, sizeof why);
+    if (r) { set_import_failure(r, why); return 0; }
+    bool game = s.nca[GI_BASE][0] && s.nca[GI_UPDATE][0], dlc = s.nca[GI_DLC1][0] || s.nca[GI_DLC2][0];
+    if (!game && (!dlc || s.nca[GI_BASE][0] || s.nca[GI_UPDATE][0])) {
+        std::string hint = trv(!s.nca[GI_BASE][0] && s.nca[GI_UPDATE][0]
+                                   ? "The base game is missing. Choose it (XCI or NSP) together with the version %s update."
+                                   : s.nca[GI_BASE][0] ? "The version %s update is missing. Choose the update's NSP together "
+                                                         "with the base game."
+                                                       : "Choose the base game (XCI or NSP) and the version %s update NSP.");
+        if (s.other[0]) hint += std::string(" ") + tr("Other titles found:") + " " + s.other;
+        bool some = s.nca[GI_BASE][0] || s.nca[GI_UPDATE][0];
+        set_job(some ? "The base game or its update is missing" : "These packages aren't Breath of the Wild's", true, hint);
+        return 0;
+    }
+    if (!game && !check_copied_files(g_root).empty()) {
+        set_job("Set up the game files first", true, "Choose the base game and its update and set them up, then the "
+                "downloadable content.");
+        return 0;
+    }
+    g_import_base = in;
+    if (game) {
+        // the update's ExeFS tells the version: checked before Savage Wind's copy is replaced
+        set_job("Checking the game files...");
+        std::string ex = work + "/exefs", id;
+        if ((r = gi_exefs(&s, ex.c_str(), why, sizeof why))) { set_import_failure(r, why); return 0; }
+        if (!nso_build_id(ex + "/main", &id)) { set_failure(FAIL_VERSION); return 0; }
+        fprintf(stderr, "[launcher] import: main build id %s\n", id.c_str());
+        const GameVersion *v = main_version(id);
+        if (!v || !v->supported) {
+            if (v) g_files_version = v->name;
+            set_failure(v ? FAIL_NOT_YET : FAIL_NOT_SUPPORTED);
+            return 0;
+        }
+        rt_remove_game_files(g_root.c_str());  // (an earlier or interrupted setup's; removes the folder too)
+        mkdir(g_root.c_str(), 0755);
+        if (rename(ex.c_str(), (g_root + "/exefs").c_str()) != 0) { set_failure(FAIL_COPY); return 0; }
+        set_job("Applying the update to the game files...");
+        if ((r = gi_romfs(&s, (g_root + "/romfs").c_str(), import_progress, why, sizeof why))) {
+            set_import_failure(r, why);
+            return 0;
+        }
+        gi_drop(&s, GI_BASE), gi_drop(&s, GI_UPDATE);
+        std::string found = check_romfs(g_root + "/romfs", *v);
+        if (!found.empty()) { set_romfs_failure(*v, found); return 0; }
+        if (!movies_complete(g_root + "/romfs")) { set_failure(FAIL_MISSING); return 0; }
+        g_import_base = in + s.nca_bytes[GI_BASE];
+    }
+    if (dlc) {
+        set_job("Setting up the downloadable content...");
+        remove_dlc(g_root);
+        for (int k = GI_DLC1; k <= GI_DLC2; k++) {
+            if (!s.nca[k][0]) continue;
+            std::string to = g_root + "/" + aoc_name(AOC_DIR, k - GI_DLC1 + 1);
+            if ((r = gi_dlc(&s, k, to.c_str(), import_progress, why, sizeof why))) {
+                remove_dlc(g_root);
+                set_import_failure(r, why);
+                return 0;
+            }
+            gi_drop(&s, k);
+            g_import_base = g_import_base + s.nca_bytes[k];
+        }
+    }
+    g_done = g_total.load();
+    return game ? 1 : 2;
+}
+
 static void *extract_thread(void *) {
     std::string src;
     pthread_mutex_lock(&g_lock);
     src = g_src;
     pthread_mutex_unlock(&g_lock);
-    g_done = 0, g_total = 0, g_build_frac = -1, g_copy_skipped = false;
+    g_done = 0, g_total = 0, g_build_frac = -1, g_copy_skipped = false, g_importing = false;
     std::string exefs, romfs;
-    std::vector<std::string> dlc;
+    std::vector<std::string> dlc, pkgs;  // (pkgs: game packages, NSP / XCI, chosen or found in the chosen folder)
     bool unusable = false;  // (game packages rather than its files)
     bool dlc_only = false;  // (the shaders precompiled are the game's: nothing new to precompile)
     bool new_version = post_update_pending(SAVAGEWIND_VERSION);  // (runtime/post_update.h: a release's first start)
@@ -787,7 +960,19 @@ static void *extract_thread(void *) {
         goto check;
     }
     set_job("Looking for the game files...");
-    find_game(src, 0, exefs, romfs, dlc, unusable);
+    pthread_mutex_lock(&g_lock);
+    if (gi_is_package(src.c_str())) pkgs = g_pkgs;
+    pthread_mutex_unlock(&g_lock);
+    if (pkgs.empty()) find_game(src, 0, exefs, romfs, dlc, unusable);
+    if (pkgs.empty() && (exefs.empty() || romfs.empty()) && unusable) find_packages(src, 0, pkgs);
+    if (!pkgs.empty()) {  // from the game packages, into the data root (runtime/game_import.h)
+        mkdir(g_root.c_str(), 0755);
+        int k = import_packages(pkgs);
+        if (!k) goto done;
+        dlc_only = k == 2;
+        if (!dlc_only && (!room_for_build() || !build_game_code())) goto done;
+        goto check;
+    }
     if (exefs.empty() && romfs.empty() && !dlc.empty()) {  // DLC alone: added to the game files set up
         if (!check_copied_files(g_root).empty()) {
             set_job("Set up the game files first", true, "Choose the folder with the game files (exefs and romfs) and set "
@@ -900,6 +1085,25 @@ static void SDLCALL picked(void *, const char *const *files, int) {
     if (!files || !files[0]) return;
     pthread_mutex_lock(&g_lock);
     g_src = files[0];
+    g_pkgs.clear();
+    pthread_mutex_unlock(&g_lock);
+}
+
+// game packages (NSP / XCI: the base game, its update, the DLC, together) and the keys to read them with
+static const SDL_DialogFileFilter PKG_FILTER[] = {{"Game packages (NSP, XCI)", "nsp;xci;nsz;xcz"}};
+static const SDL_DialogFileFilter KEYS_FILTER[] = {{"Keys", "keys"}};
+static void SDLCALL picked_pkgs(void *, const char *const *files, int) {
+    if (!files || !files[0]) return;
+    pthread_mutex_lock(&g_lock);
+    g_pkgs.clear();
+    for (int i = 0; files[i]; i++) g_pkgs.push_back(files[i]);
+    g_src = g_pkgs[0];
+    pthread_mutex_unlock(&g_lock);
+}
+static void SDLCALL picked_keys(void *, const char *const *files, int) {
+    if (!files || !files[0]) return;
+    pthread_mutex_lock(&g_lock);
+    g_keys_pick = files[0];
     pthread_mutex_unlock(&g_lock);
 }
 
@@ -1827,9 +2031,16 @@ extern "C" void launcher_run(const char *root, int mode) {
                 }
 
                 pthread_mutex_lock(&g_lock);
-                std::string src = g_src, job = g_job, job_hint = g_job_hint;
+                std::string src = g_src, job = g_job, job_hint = g_job_hint, keys_pick;
+                std::vector<std::string> pkgs = g_pkgs;
+                keys_pick.swap(g_keys_pick);
                 bool failed = g_job_failed;
                 pthread_mutex_unlock(&g_lock);
+                if (!keys_pick.empty()) {
+                    snprintf(g_settings.prod_keys, sizeof g_settings.prod_keys, "%s", keys_pick.c_str());
+                    settings_save();
+                }
+                bool src_pkg = !src.empty() && gi_is_package(src.c_str());
                 bool ready = status.empty() && !busy;  // (set up: the window offers to delete them, or set them up again)
                 bool shipped_release = post_update_shipped();
                 // chosen: "Selected" with a green check (long paths ran over the label); the path is in the
@@ -1847,13 +2058,12 @@ extern "C" void launcher_run(const char *root, int mode) {
                 std::string src_d = trv("The folder with your own extracted game files: exefs (main, main.npdm, sdk...) and "
                                         "romfs, version %s with the update merged in. The game isn't included with Savage Wind.");
                 if (!src.empty()) src_d += std::string("\n\n") + tr("Chosen:") + " " + src;
-                // the step that's running / its result, under the rows and in the Set up row's explanation
+                // the step that's running / its result, under the rows and the Set up button
                 const std::string &job_line = job;
-                std::string ex_d = tr("Copies the game files Savage Wind needs and recompiles the game from them. This only "
+                // what Set up does (under its button)
+                const char *ex_d = tr("Copies the game files Savage Wind needs and recompiles the game from them. This only "
                                       "needs to be done once and may take a while. Your own files aren't changed.");
-                if (!job.empty())
-                    ex_d += std::string("\n\n") + trv(job) + (job_hint.empty() ? "" : std::string(".\n") + trv(job_hint));
-                std::string again_d = tr("Sets the game files up again from the folder chosen above, in place of Savage Wind's "
+                const char *again_d = tr("Sets the game files up again from the folder chosen above, in place of Savage Wind's "
                                          "copy. With no folder chosen, builds the game code again from Savage Wind's copy. "
                                          "Saves and settings are kept.");
 
@@ -1964,22 +2174,65 @@ extern "C" void launcher_run(const char *root, int mode) {
                 }
                 if (!ready || !g_confirm_delete) {  // choose the folder, set up (again: from it, or the game code alone)
                     opt_section(!ready ? "Your copy of the game" : "Set up again");
+                    // what the game comes as: then only what that needs (a choice for the other is dropped)
+                    bool use_pkgs = g_settings.game_packages;
+                    if (busy) opt_disable_next();
+                    if (opt_radio("Extracted game files", !use_pkgs, tr("A folder with the game's extracted exefs and romfs "
+                                  "(and the DLC's RomFS folders, if you have them)."))) use_pkgs = false;
+                    if (!ready) first_row();
+                    if (busy) opt_disable_next();
+                    if (opt_radio("Game packages (NSP / XCI)", use_pkgs, tr("Your own dump of the game as it comes from the "
+                                  "console: XCI or NSP files, read with your console's keys."))) use_pkgs = true;
+                    if (use_pkgs != g_settings.game_packages) {
+                        g_settings.game_packages = use_pkgs;
+                        settings_save();
+                        pthread_mutex_lock(&g_lock);
+                        if (src_pkg != use_pkgs) g_src.clear(), g_pkgs.clear(), src.clear(), src_pkg = false;
+                        pthread_mutex_unlock(&g_lock);
+                    }
+                    opt_indent(1);
+                    if (!use_pkgs) {
                     if (busy) opt_disable_next();
                     if (opt_action("Game files folder", src_v.c_str(), src_d.c_str(), true))
                         SDL_ShowOpenFolderDialog(picked, NULL, win, NULL, false);
                     if (!src.empty()) check_left_of_value(src_v);
-                    if (!ready) {
-                        first_row();
-                        opt_section("Set up");
+                    } else {
+                    // the game packages themselves (runtime/game_import.h), read with the player's own keys
+                    std::string pkg_v = tr(src_pkg ? "Selected" : "Choose...");
+                    std::string pkg_d = trv("Choose them together: the base game (XCI or NSP), the version %s update NSP "
+                                            "and, if you have them, the two DLC NSPs (or one XCI that holds them all). "
+                                            "They're decrypted with your keys and the update is applied over the base game.");
+                    if (src_pkg) {
+                        pkg_d += std::string("\n\n") + tr("Chosen:");
+                        for (auto &p : pkgs) pkg_d += "\n" + p.substr(p.find_last_of("/\\") + 1);
                     }
+                    if (busy) opt_disable_next();
+                    if (opt_action("Package files", pkg_v.c_str(), pkg_d.c_str(), true))
+                        SDL_ShowOpenFileDialog(picked_pkgs, NULL, win, PKG_FILTER, 1, NULL, true);
+                    if (src_pkg) check_left_of_value(pkg_v);
+                    char keys[1100];
+                    gi_find_keys(g_settings.prod_keys, keys, sizeof keys);
+                    bool have_keys = keys[0] && file_exists(keys);
+                    std::string keys_v = tr(have_keys ? "Selected" : "Choose...");
+                    std::string keys_d = tr("The prod.keys of your own console, only needed for game packages. A title.keys "
+                                            "next to it is read too. No keys come with Savage Wind, and yours stay on this PC.");
+                    if (have_keys) keys_d += std::string("\n\n") + tr("Chosen:") + " " + keys;
+                    if (busy) opt_disable_next();
+                    if (opt_action("Decryption keys", keys_v.c_str(), keys_d.c_str(), true))
+                        SDL_ShowOpenFileDialog(picked_keys, NULL, win, KEYS_FILTER, 1, NULL, false);
+                    if (have_keys) check_left_of_value(keys_v);
+                    }
+                    opt_indent(-1);
+                    if (!ready) opt_section("Set up");
 #ifndef __APPLE__
                     if (shader_precompile_available()) {
                         if (busy) opt_disable_next();
                         {   // the background (ui/splash.mm), from the next start
-                            static const char *const pics[START_PICTURE_COUNT] = {"Savage Wind", "A screenshot", "Latest save"};
+                            static const char *const pics[START_PICTURE_COUNT] = {"Savage Wind", "A screenshot", "Latest save", "None"};
                             if (opt_choice("Background", &g_settings.start_picture, pics, START_PICTURE_COUNT,
                                            START_PICTURE_SCREENSHOT, "The picture behind this screen and while the game loads. A splash.jpg or splash.png of yours in the data folder always comes first."))
                                 settings_save();
+                            if (g_settings.start_picture == START_PICTURE_NONE) opt_disable_next();  // (no picture to show)
                             if (opt_toggle("Loading picture", &g_settings.boot_picture, true, "Shows that picture while the game loads. Turned off, the window stays black until the game's title screen: loading takes just as long."))
                                 settings_save();
                         }
@@ -2034,9 +2287,30 @@ extern "C" void launcher_run(const char *root, int mode) {
                             pthread_detach(st);
                         }
                     }
-                    if (busy || (src.empty() && !check_copied_files(g_root).empty())) opt_disable_next();
-                    if (opt_action("Set up game files", busy ? tr("Working...") : "", ready ? again_d.c_str() : ex_d.c_str(),
-                                   true)) {
+                    // SET UP: the page's one big button, under the rows (what it does: the rows' explanation pane)
+                    char keys_found[1100];
+                    gi_find_keys(g_settings.prod_keys, keys_found, sizeof keys_found);
+                    bool keys_missing = src_pkg && !(keys_found[0] && file_exists(keys_found));
+                    bool can_set_up = !busy && !keys_missing && !(src.empty() && !check_copied_files(g_root).empty());
+                    ImGui::Dummy(ImVec2(0, 12 * sc));
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.52f, 0.30f, 1));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.26f, 0.64f, 0.37f, 1));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.17f, 0.44f, 0.26f, 1));
+                    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6 * sc);
+                    ImGui::BeginDisabled(!can_set_up);
+                    std::string set_up = busy ? tr("Working...") : tr(ready ? "Set up again" : "Set up game files");
+                    for (auto &c : set_up) c = (char)toupper((unsigned char)c);
+                    bool set_up_now = ImGui::Button(set_up.c_str(), ImVec2(ImGui::GetContentRegionAvail().x, 58 * sc));
+                    ImGui::EndDisabled();
+                    ImGui::PopStyleVar();
+                    ImGui::PopStyleColor(3);
+                    ImGui::PushTextWrapPos(0);
+                    if (!can_set_up && !busy)
+                        ImGui::TextDisabled("%s", tr(use_pkgs ? "Choose your game packages and keys above first."
+                                                              : "Choose the folder with the game files above first."));
+                    else if (!busy) ImGui::TextDisabled("%s", ready ? again_d : ex_d);
+                    ImGui::PopTextWrapPos();
+                    if (set_up_now) {
                         settings_save();  // (the colour look as chosen above)
                         g_file_size.set_suspended(true);
                         pthread_mutex_lock(&g_lock);
@@ -2119,6 +2393,11 @@ extern "C" void launcher_run(const char *root, int mode) {
                             atomic_store(&g_pc.cancel, true);
                     }
 #endif
+                    if (g_importing && g_build_frac < 0) {  // (unpacking / merging the game packages: hactool is ended)
+                        nnotes = 2;
+                        if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false))
+                            gi_cancel();
+                    }
                     float tfs = g_font_menu->FontSize * 0.75f, sfs = g_font_small->FontSize * 0.85f;
                     ImVec2 ts = g_font_menu->CalcTextSizeA(tfs, FLT_MAX, 0, title);
                     float line_h = g_font_small->CalcTextSizeA(sfs, FLT_MAX, 0, "A").y;

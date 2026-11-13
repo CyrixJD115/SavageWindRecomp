@@ -79,7 +79,8 @@ static bool pick_picture(char *out, size_t n) {
     if (!done) {
         done = true;
         char own[1100];
-        if (rt_user_splash(own, sizeof own)) picked = own;
+        if (g_settings.start_picture == START_PICTURE_NONE) {}  // (no picture at all, not even the player's own)
+        else if (rt_user_splash(own, sizeof own)) picked = own;
         else if (g_settings.start_picture == START_PICTURE_SCREENSHOT) picked = random_screenshot();
         else if (g_settings.start_picture == START_PICTURE_SAVE) {
             const char *sd = sp_session_save_dir();
@@ -505,6 +506,10 @@ static void forest_art(ImDrawList *dl, ImVec2 sz, float t) {
 }
 
 void splash_draw(ImDrawList *dl, ImVec2 sz, float t) {
+    if (g_settings.start_picture == START_PICTURE_NONE) {  // (Background: None)
+        dl->AddRectFilled(ImVec2(0, 0), sz, rgba(0x0e1112));
+        return;
+    }
     if (!g_tex) { forest_art(dl, sz, t); return; }
     // the picture fills the window (cropped to its shape, centred)
     float ia = (float)g_tex_w / g_tex_h, da = sz.x / sz.y;

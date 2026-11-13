@@ -74,7 +74,8 @@ enum { TEX_LOD_DEFAULT = 0, TEX_LOD_SHARP = 1, TEX_LOD_SHARPER = 2, TEX_LOD_COUN
 // binaural head-shadow and ear-delay cues for headphones.
 enum { AUDIO_OUT_STEREO = 0, AUDIO_OUT_SURROUND_51 = 1, AUDIO_OUT_HEADPHONES_3D = 2, AUDIO_OUT_COUNT };
 // The start screen's background, when there is no splash.jpg / .png of the player's in the data folder
-enum { START_PICTURE_ART, START_PICTURE_SCREENSHOT, START_PICTURE_SAVE, START_PICTURE_COUNT };
+enum { START_PICTURE_ART, START_PICTURE_SCREENSHOT, START_PICTURE_SAVE,
+       START_PICTURE_NONE /* a plain dark start screen, and no picture while the game loads */, START_PICTURE_COUNT };
 
 typedef struct {
     bool fullscreen;
@@ -161,6 +162,8 @@ typedef struct {
     int color_tint;          // -100 (green) .. 100 (magenta)
     char color_lut[128];     // color_lut_id(): "" none, "sw:<file>" shipped, "<file>" the player's luts/ folder
     int color_lut_strength;  // percent, 0..100
+    bool game_packages;      // the game files page sets up from game packages (NSP / XCI), not an extracted folder
+    char prod_keys[1024];    // the player's own prod.keys, for game files from NSP / XCI (runtime/game_import.h); "" = ~/.switch
     bool color_lut_set;      // the ini names a LUT (or none): the player chose; the first setup offers COLOR_LUT_RECOMMENDED
     // Options > Accessibility (runtime/assists.c): assists, each off by default
     bool no_weapon_wear;     // weapons, bows and shields lose no durability and never break
